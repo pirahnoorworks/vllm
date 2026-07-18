@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -40,6 +41,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.kv_block_trace import KVBlockTraceWriter
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -104,6 +106,10 @@ class Scheduler(SchedulerInterface):
         )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
+        self._kv_block_trace_writer: KVBlockTraceWriter | None = None
+        self._kv_block_trace_interval = max(
+            1, int(os.getenv("VLLM_KV_BLOCK_TRACE_INTERVAL", "1"))
+        )
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
@@ -117,6 +123,17 @@ class Scheduler(SchedulerInterface):
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
         )
+
+        trace_enabled = os.getenv("VLLM_KV_BLOCK_TRACE_ENABLE", "1") != "0"
+        trace_path = os.getenv(
+            "VLLM_KV_BLOCK_TRACE_PATH", "/tmp/vllm_kv_block_trace.jsonl"
+        )
+        if trace_enabled:
+            self._kv_block_trace_writer = KVBlockTraceWriter(
+                output_path=trace_path,
+                num_total_blocks=self.kv_cache_config.num_blocks,
+                num_groups=len(self.kv_cache_config.kv_cache_groups),
+            )
         # Diffusion models may not sample any tokens for a denoising step.
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
@@ -1163,7 +1180,41 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._write_kv_block_trace(scheduler_output)
         return scheduler_output
+
+    def _write_kv_block_trace(self, scheduler_output: SchedulerOutput) -> None:
+        writer = self._kv_block_trace_writer
+        if writer is None:
+            return
+        if self.current_step % self._kv_block_trace_interval != 0:
+            return
+
+        running_req_ids = [req.request_id for req in self.running]
+        waiting_req_ids = [req.request_id for req in self.waiting]
+        skipped_waiting_req_ids = [req.request_id for req in self.skipped_waiting]
+        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+
+        req_blocks: dict[str, list[list[int]]] = {}
+        used_block_ids: set[int] = set()
+        for req_id in sorted(self.requests):
+            groups = self.kv_cache_manager.get_block_ids(req_id)
+            group_block_ids = [list(group) for group in groups]
+            req_blocks[req_id] = group_block_ids
+            for group in group_block_ids:
+                used_block_ids.update(group)
+
+        writer.write_step(
+            step=self.current_step,
+            num_free_blocks=self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            kv_cache_usage=self.kv_cache_manager.usage,
+            running_req_ids=running_req_ids,
+            waiting_req_ids=waiting_req_ids,
+            skipped_waiting_req_ids=skipped_waiting_req_ids,
+            scheduled_req_ids=scheduled_req_ids,
+            req_blocks=req_blocks,
+            used_block_ids=sorted(used_block_ids),
+        )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2395,6 +2446,8 @@ class Scheduler(SchedulerInterface):
         logger.debug_once("[shutdown] Scheduler: start")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
+        if self._kv_block_trace_writer is not None:
+            self._kv_block_trace_writer.close()
         if self.connector is not None:
             self.connector.shutdown()
 
