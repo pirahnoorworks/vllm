@@ -58,6 +58,20 @@ Open the generated HTML in a browser. Features:
 - per-step alloc/free deltas
 - hover any block to see block ID and owner request IDs
 
+## 4) Compute summary metrics
+
+```bash
+.venv/bin/python tools/profiler/kv_block_trace/summarize_kv_block_trace.py \
+  /tmp/vllm_kv_block_trace.jsonl
+```
+
+Add `--json` for machine-readable output.
+
+## 5) Recruiter showcase page
+
+See [docs/community/kv-block-trace-showcase.md](docs/community/kv-block-trace-showcase.md)
+for a polished demo flow, architecture diagram, and concise presentation script.
+
 ## Legend
 
 - `free`: gray
